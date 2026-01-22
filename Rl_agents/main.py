@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'Dash_Game'))
 
 from src.game_env import DashGameEnv, DashTrainingManager, ReplayFrame
 from src.replay_viewer import ReplayViewer, save_replay_to_file
-from agents import DQNAgent, EpsilonGreedyAgent, RandomAgent, DuelingDQNAgent, StackedFramesDQNAgent
+from agents import DQNAgent, EpsilonGreedyAgent, RandomAgent
 from visualizer import TrainingPlotter, JumpHeatmap
 
 
@@ -142,7 +142,6 @@ def train_agent(agent,
                 level_path: str = "layouts/level1.csv",
                 num_episodes: int = 1000,
                 max_steps: int = 5000,
-                replay_frequency: int = 500,
                 print_frequency: int = 100,
                 save_frequency: int = 500,
                 save_path: str = "checkpoints"):
@@ -155,7 +154,6 @@ def train_agent(agent,
         level_path: Chemin vers le niveau (relatif à Dash_Game)
         num_episodes: Nombre d'épisodes d'entraînement
         max_steps: Maximum de steps par épisode
-        replay_frequency: Fréquence d'enregistrement des replays (1/N)
         print_frequency: Fréquence d'affichage des stats
         save_frequency: Fréquence de sauvegarde de l'agent (garde le meilleur de l'intervalle)
         save_path: Dossier de sauvegarde
@@ -172,7 +170,6 @@ def train_agent(agent,
         # Gestionnaire d'entraînement
         manager = DashTrainingManager(
             level_path=level_path,
-            replay_frequency=replay_frequency,
             save_replays=True
         )
         
@@ -192,8 +189,7 @@ def train_agent(agent,
         global_best_episode = 0
         
         for episode in range(1, num_episodes + 1):
-            # Créer l'environnement - enregistrer plus souvent pour le tracker
-            # should_record = (episode % max(1, replay_frequency // 4) == 0)
+            # Créer l'environnement
             env = DashGameEnv(level_path, record_replay=False, max_steps=max_steps)
             
             # Réinitialiser le frame buffer si agent avec mémoire temporelle
@@ -480,16 +476,14 @@ def main():
                        choices=['train', 'eval', 'watch', 'compare'],
                        help='Mode: train, eval, watch, or compare agents')
     parser.add_argument('--agent', type=str, default='dqn',
-                       choices=['dqn', 'dueling', 'stacked', 'epsilon', 'random'],
-                       help='Type of agent: dqn, dueling (Dueling DQN), stacked (Stacked Frames), epsilon, random')
+                       choices=['dqn', 'epsilon', 'random'],
+                       help='Type of agent: dqn, epsilon, random')
     parser.add_argument('--level', type=str, default='layouts/level1.csv',
                        help='Path to level file')
     parser.add_argument('--episodes', type=int, default=1000,
                        help='Number of training episodes')
     parser.add_argument('--max-steps', type=int, default=5000,
                        help='Maximum steps per episode')
-    parser.add_argument('--replay-freq', type=int, default=500,
-                       help='Frequency of replay recording')
     parser.add_argument('--load', type=str, default=None,
                        help='Path to load agent from')
     parser.add_argument('--replay', type=str, default=None,
@@ -502,6 +496,7 @@ def main():
                        help='Directory to save checkpoints')
     
     args = parser.parse_args()
+    env = DashGameEnv(args.level, record_replay=True, max_steps=args.max_steps)
     
     # Mode Grid Search
     if args.grid_search:
@@ -530,16 +525,22 @@ def main():
             print(f"\nConfiguration {i+1}/{len(combinations)}: {params}")
             
             # Créer l'agent avec ces paramètres
+            # agent = DQNAgent(
+            #     state_size=95,  # 5 + 30 * 3 (updated observation space)
+            #     action_size=2,
+            #     learning_rate=params['learning_rate'],
+            #     hidden_sizes=params['hidden_sizes'],
+            #     gamma=params['gamma'],
+            #     batch_size=params['batch_size'],
+            #     epsilon_start=1.0,
+            #     epsilon_end=0.05,
+            #     epsilon_decay=0.99
+            # )
             agent = DQNAgent(
-                state_size=95,  # 5 + 30 * 3 (updated observation space)
+                state_size=env.observation_size, 
                 action_size=2,
-                learning_rate=params['learning_rate'],
-                hidden_sizes=params['hidden_sizes'],
-                gamma=params['gamma'],
-                batch_size=params['batch_size'],
-                epsilon_start=1.0,
-                epsilon_end=0.05,
-                epsilon_decay=0.99
+                batch_size=256, # Plus gros batch pour GPU
+                learning_rate=0.0003 # Learning rate plus fin pour stabilité
             )
             
             # Entraînement court (pour test)
@@ -578,30 +579,11 @@ def main():
 
     # Créer l'agent
     if args.agent == 'dqn':
-        agent = DQNAgent()
-        if args.load:
-            agent.load(args.load)
-    elif args.agent == 'dueling':
-        agent = DuelingDQNAgent(
-            state_size=95,
+        agent = DQNAgent(
+            state_size=env.observation_size, 
             action_size=2,
-            hidden_sizes=[256, 128],
-            learning_rate=0.005,
-            gamma=0.99,
-            epsilon_decay=0.995,
-            use_prioritized_replay=True
-        )
-        if args.load:
-            agent.load(args.load)
-    elif args.agent == 'stacked':
-        agent = StackedFramesDQNAgent(
-            base_state_size=95,
-            num_frames=4,
-            action_size=2,
-            hidden_sizes=[256, 128, 64],
-            learning_rate=0.005,
-            gamma=0.99,
-            epsilon_decay=0.995
+            batch_size=256, # Plus gros batch pour GPU
+            learning_rate=0.0003 # Learning rate plus fin pour stabilité
         )
         if args.load:
             agent.load(args.load)
@@ -616,7 +598,6 @@ def main():
             level_path=args.level,
             num_episodes=args.episodes,
             max_steps=args.max_steps,
-            replay_frequency=args.replay_freq,
             save_path=args.save_path
         )
         
@@ -688,9 +669,7 @@ def main():
         agents = {
             'Random': RandomAgent(),
             'Epsilon-Greedy': EpsilonGreedyAgent(),
-            'DQN': DQNAgent(),
-            'Dueling DQN': DuelingDQNAgent(),
-            'Stacked Frames DQN': StackedFramesDQNAgent()
+            'DQN': DQNAgent()
         }
         
         for name, agent in agents.items():

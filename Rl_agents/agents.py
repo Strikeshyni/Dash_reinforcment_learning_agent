@@ -4,13 +4,156 @@ Agent de reinforcement learning avec Deep Q-Network
 Inspiré du TP1 Ruée vers l'or
 """
 
+import pickle
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
 import random
-from collections import deque
-from typing import List, Tuple, Optional
-import pickle
-import os
 import copy
+from collections import deque
+from typing import List, Tuple
+
+# Détection du device (GPU/CPU) [cite: 121]
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Support pour Mac M1/M2 si disponible
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+
+class DQN(nn.Module):
+    """Réseau de neurones pour approximer la Q-value [cite: 19]"""
+    def __init__(self, input_dim, output_dim, hidden_sizes):
+        super(DQN, self).__init__()
+        layers = []
+        prev_dim = input_dim
+        
+        # Construction dynamique des couches cachées
+        for hidden_size in hidden_sizes:
+            layers.append(nn.Linear(prev_dim, hidden_size))
+            layers.append(nn.ReLU()) # [cite: 122]
+            prev_dim = hidden_size
+            
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+
+class DQNAgent:
+    def __init__(self, 
+                 state_size: int = 95, 
+                 action_size: int = 2,
+                 hidden_sizes: List[int] = [256, 128], # Augmenté pour plus de capacité
+                 learning_rate: float = 0.0005, # Réduit pour stabilité
+                 gamma: float = 0.99,
+                 epsilon_start: float = 1.0,
+                 epsilon_end: float = 0.01,
+                 epsilon_decay: float = 0.995,
+                 batch_size: int = 64, # [cite: 118]
+                 buffer_capacity: int = 50000):
+        
+        self.state_size = state_size
+        self.action_size = action_size
+        self.gamma = gamma
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        self.batch_size = batch_size
+        self.target_update_freq = 500  # Fréquence de mise à jour du target net
+        
+        # Initialisation des réseaux (Policy et Target) 
+        self.policy_net = DQN(state_size, action_size, hidden_sizes).to(device)
+        self.target_net = DQN(state_size, action_size, hidden_sizes).to(device)
+        self.target_net.load_state_dict(self.policy_net.state_dict()) # Copie initiale
+        self.target_net.eval() # Le target net n'est pas entraîné directement
+        
+        # Optimiseur et Loss [cite: 125, 126]
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
+        self.criterion = nn.MSELoss() # ou nn.SmoothL1Loss() pour plus de robustesse
+        
+        # Replay Buffer (Deques sont très rapides en Python pour push/pop)
+        self.memory = deque(maxlen=buffer_capacity)
+        self.training_steps = 0
+
+    def select_action(self, state: np.ndarray, training: bool = True) -> int:
+        """Epsilon-Greedy selection [cite: 371]"""
+        if training and random.random() < self.epsilon:
+            return random.randint(0, self.action_size - 1)
+        
+        # Conversion en tenseur PyTorch sans calcul de gradient [cite: 128]
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+            q_values = self.policy_net(state_tensor)
+            return q_values.argmax().item()
+
+    def update(self, state, action, reward, next_state, done):
+        """Stockage de la transition et déclenchement de l'apprentissage"""
+        # Stocker sous forme de tuples simples pour économiser la RAM
+        self.memory.append((state, action, reward, next_state, done))
+        
+        # Décroissance d'Epsilon
+        if self.epsilon > self.epsilon_end:
+            self.epsilon *= self.epsilon_decay
+            
+        # Apprentissage si assez de données
+        if len(self.memory) >= self.batch_size:
+            self._train_step()
+
+    def _train_step(self):
+        # 1. Échantillonnage aléatoire (Experience Replay) 
+        batch = random.sample(self.memory, self.batch_size)
+        state_batch, action_batch, reward_batch, next_state_batch, done_batch = zip(*batch)
+
+        # Conversion rapide en tenseurs GPU
+        state_batch = torch.FloatTensor(np.array(state_batch)).to(device)
+        action_batch = torch.LongTensor(action_batch).unsqueeze(1).to(device)
+        reward_batch = torch.FloatTensor(reward_batch).unsqueeze(1).to(device)
+        next_state_batch = torch.FloatTensor(np.array(next_state_batch)).to(device)
+        done_batch = torch.FloatTensor(done_batch).unsqueeze(1).to(device)
+
+        # 2. Calcul des Q-values courantes Q(s, a)
+        # gather récupère la Q-value correspondant à l'action prise
+        current_q_values = self.policy_net(state_batch).gather(1, action_batch)
+
+        # 3. Calcul des Q-values cibles (Bellman Optimality Equation) [cite: 450]
+        # V*(s) = max_a Q*(s,a) avec le Target Network pour la stabilité
+        with torch.no_grad():
+            next_q_values = self.target_net(next_state_batch).max(1)[0].unsqueeze(1)
+            # Si done est True, le futur reward est 0
+            target_q_values = reward_batch + (self.gamma * next_q_values * (1 - done_batch))
+
+        # 4. Calcul de la perte et Gradient Descent [cite: 126]
+        loss = self.criterion(current_q_values, target_q_values)
+        
+        self.optimizer.zero_grad() # Reset gradients
+        loss.backward()            # Backpropagation
+        # Gradient clipping pour éviter l'explosion des gradients (optionnel mais recommandé)
+        torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
+        self.optimizer.step()      # Mise à jour des poids
+
+        self.training_steps += 1
+
+        # 5. Mise à jour périodique du Target Network 
+        if self.training_steps % self.target_update_freq == 0:
+            self.target_weights = copy.deepcopy(self.policy_net.state_dict())
+            self.target_net.load_state_dict(self.target_weights)
+
+    def save(self, filepath: str):
+        torch.save({
+            'policy_net': self.policy_net.state_dict(),
+            'target_net': self.target_net.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'epsilon': self.epsilon,
+            'steps': self.training_steps
+        }, filepath)
+
+    def load(self, filepath: str):
+        checkpoint = torch.load(filepath, map_location=device)
+        self.policy_net.load_state_dict(checkpoint['policy_net'])
+        self.target_net.load_state_dict(checkpoint['target_net'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.epsilon = checkpoint['epsilon']
+        self.training_steps = checkpoint.get('steps', 0)
 
 
 class ReplayBuffer:
@@ -32,7 +175,7 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-class DQNAgent:
+class DQNAgent_old:
     """
     Agent DQN pour le jeu Dash
     Utilise un réseau de neurones simple pour approximer la Q-fonction
@@ -460,441 +603,3 @@ class PrioritizedReplayBuffer:
     
     def __len__(self) -> int:
         return len(self.buffer)
-
-
-class DuelingDQNAgent:
-    """
-    Dueling DQN Agent
-    Sépare l'estimation de la valeur d'état V(s) et de l'avantage A(s,a)
-    Q(s,a) = V(s) + (A(s,a) - mean(A))
-    
-    Meilleur pour apprendre quand l'action n'a pas d'importance
-    """
-    
-    def __init__(self, 
-                 state_size: int = 95,
-                 action_size: int = 2,
-                 hidden_sizes: List[int] = [256, 128],
-                 learning_rate: float = 0.001,
-                 gamma: float = 0.99,
-                 epsilon_start: float = 1.0,
-                 epsilon_end: float = 0.01,
-                 epsilon_decay: float = 0.995,
-                 batch_size: int = 64,
-                 buffer_capacity: int = 100000,
-                 use_prioritized_replay: bool = True):
-        
-        self.state_size = state_size
-        self.action_size = action_size
-        self.hidden_sizes = hidden_sizes
-        self.learning_rate = learning_rate
-        self.gamma = gamma
-        self.epsilon = epsilon_start
-        self.epsilon_end = epsilon_end
-        self.epsilon_decay = epsilon_decay
-        self.batch_size = batch_size
-        self.use_prioritized_replay = use_prioritized_replay
-        
-        self.target_update_freq = 500
-        self.last_target_update = 0
-        
-        # Buffer
-        if use_prioritized_replay:
-            self.replay_buffer = PrioritizedReplayBuffer(buffer_capacity)
-        else:
-            self.replay_buffer = ReplayBuffer(buffer_capacity)
-        
-        # Réseau dueling
-        self.weights = self._init_dueling_weights()
-        self.target_weights = copy.deepcopy(self.weights)
-        
-        self.training_steps = 0
-    
-    def _init_dueling_weights(self) -> dict:
-        """Initialise les poids pour l'architecture dueling"""
-        weights = {}
-        input_size = self.state_size
-        
-        # Couches partagées
-        shared_weights = []
-        for i, hidden_size in enumerate(self.hidden_sizes[:-1]):
-            w = np.random.randn(input_size, hidden_size) * np.sqrt(2.0 / input_size)
-            b = np.zeros(hidden_size)
-            shared_weights.append((w, b))
-            input_size = hidden_size
-        
-        weights['shared'] = shared_weights
-        
-        # Stream de valeur V(s)
-        last_hidden = self.hidden_sizes[-1] if len(self.hidden_sizes) > 1 else self.hidden_sizes[0]
-        prev_size = self.hidden_sizes[-2] if len(self.hidden_sizes) > 1 else self.state_size
-        
-        w_v1 = np.random.randn(prev_size, last_hidden) * np.sqrt(2.0 / prev_size)
-        b_v1 = np.zeros(last_hidden)
-        w_v2 = np.random.randn(last_hidden, 1) * np.sqrt(2.0 / last_hidden)
-        b_v2 = np.zeros(1)
-        weights['value'] = [(w_v1, b_v1), (w_v2, b_v2)]
-        
-        # Stream d'avantage A(s,a)
-        w_a1 = np.random.randn(prev_size, last_hidden) * np.sqrt(2.0 / prev_size)
-        b_a1 = np.zeros(last_hidden)
-        w_a2 = np.random.randn(last_hidden, self.action_size) * np.sqrt(2.0 / last_hidden)
-        b_a2 = np.zeros(self.action_size)
-        weights['advantage'] = [(w_a1, b_a1), (w_a2, b_a2)]
-        
-        return weights
-    
-    def _relu(self, x: np.ndarray) -> np.ndarray:
-        return np.maximum(0, x)
-    
-    def _forward_dueling(self, state: np.ndarray, use_target: bool = False) -> np.ndarray:
-        """Forward pass avec architecture dueling"""
-        weights_to_use = self.target_weights if use_target else self.weights
-        
-        x = state
-        
-        # Couches partagées
-        for w, b in weights_to_use['shared']:
-            x = self._relu(np.dot(x, w) + b)
-        
-        # Stream de valeur
-        v = x
-        for i, (w, b) in enumerate(weights_to_use['value']):
-            v = np.dot(v, w) + b
-            if i < len(weights_to_use['value']) - 1:
-                v = self._relu(v)
-        
-        # Stream d'avantage
-        a = x
-        for i, (w, b) in enumerate(weights_to_use['advantage']):
-            a = np.dot(a, w) + b
-            if i < len(weights_to_use['advantage']) - 1:
-                a = self._relu(a)
-        
-        # Combiner: Q = V + (A - mean(A))
-        q_values = v + (a - np.mean(a, axis=-1, keepdims=True))
-        
-        return q_values
-    
-    def predict(self, state: np.ndarray) -> np.ndarray:
-        if state.ndim == 1:
-            state = state.reshape(1, -1)
-        return self._forward_dueling(state, use_target=False)
-    
-    def select_action(self, state: np.ndarray, training: bool = True) -> int:
-        if training and random.random() < self.epsilon:
-            return random.randint(0, self.action_size - 1)
-        
-        q_values = self.predict(state)
-        return int(np.argmax(q_values))
-    
-    def update(self, state: np.ndarray, action: int, reward: float,
-               next_state: np.ndarray, done: bool):
-        self.replay_buffer.push(state, action, reward, next_state, done)
-        
-        if len(self.replay_buffer) >= self.batch_size:
-            self._train_step()
-    
-    def _train_step(self):
-        """Entraînement avec support prioritized replay"""
-        if self.use_prioritized_replay:
-            batch, indices, weights = self.replay_buffer.sample(self.batch_size)
-            if len(batch) == 0:
-                return
-        else:
-            batch = self.replay_buffer.sample(self.batch_size)
-            weights = np.ones(len(batch))
-        
-        states = np.array([t[0] for t in batch])
-        actions = np.array([t[1] for t in batch])
-        rewards = np.array([t[2] for t in batch])
-        next_states = np.array([t[3] for t in batch])
-        dones = np.array([t[4] for t in batch])
-        
-        # Double DQN: sélection avec réseau principal, évaluation avec target
-        next_q_main = self._forward_dueling(next_states, use_target=False)
-        next_actions = np.argmax(next_q_main, axis=1)
-        
-        next_q_target = self._forward_dueling(next_states, use_target=True)
-        max_next_q = next_q_target[np.arange(len(batch)), next_actions]
-        
-        targets = rewards + self.gamma * max_next_q * (1 - dones)
-        
-        current_q = self._forward_dueling(states, use_target=False)
-        td_errors = targets - current_q[np.arange(len(batch)), actions]
-        
-        # Update priorities si prioritized replay
-        if self.use_prioritized_replay:
-            self.replay_buffer.update_priorities(indices, td_errors)
-        
-        # Backprop simplifié (mise à jour basée sur TD error pondéré)
-        self._simple_update(states, actions, targets, weights)
-        
-        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-        self.training_steps += 1
-        
-        if self.training_steps - self.last_target_update >= self.target_update_freq:
-            self.target_weights = copy.deepcopy(self.weights)
-            self.last_target_update = self.training_steps
-    
-    def _simple_update(self, states, actions, targets, weights):
-        """Mise à jour simplifiée des poids"""
-        # Pour simplifier, on utilise une mise à jour directe
-        # Une implémentation complète nécessiterait un backprop complet
-        current_q = self._forward_dueling(states, use_target=False)
-        td_errors = targets - current_q[np.arange(len(states)), actions]
-        
-        # Mise à jour proportionnelle à l'erreur (très simplifié)
-        for layer_weights in [self.weights['shared'], self.weights['value'], self.weights['advantage']]:
-            for i, (w, b) in enumerate(layer_weights):
-                # Petite perturbation dans la direction de réduction de l'erreur
-                grad_scale = self.learning_rate * np.mean(np.abs(td_errors * weights))
-                noise = np.random.randn(*w.shape) * grad_scale * 0.01
-                layer_weights[i] = (w + noise, b)
-    
-    def save(self, filepath: str):
-        data = {
-            'weights': self.weights,
-            'target_weights': self.target_weights,
-            'epsilon': self.epsilon,
-            'training_steps': self.training_steps,
-            'config': {
-                'state_size': self.state_size,
-                'action_size': self.action_size,
-                'hidden_sizes': self.hidden_sizes,
-                'learning_rate': self.learning_rate,
-                'gamma': self.gamma,
-                'use_prioritized_replay': self.use_prioritized_replay
-            }
-        }
-        with open(filepath, 'wb') as f:
-            pickle.dump(data, f)
-        print(f"Dueling DQN Agent saved to {filepath}")
-    
-    def load(self, filepath: str):
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
-        self.weights = data['weights']
-        self.target_weights = data.get('target_weights', copy.deepcopy(self.weights))
-        self.epsilon = data['epsilon']
-        self.training_steps = data['training_steps']
-        print(f"Dueling DQN Agent loaded from {filepath}")
-
-
-class StackedFramesDQNAgent:
-    """
-    DQN avec frames empilées (mémoire temporelle)
-    Permet à l'agent de voir la dynamique du jeu (vitesse, accélération)
-    """
-    
-    def __init__(self,
-                 base_state_size: int = 95,
-                 num_frames: int = 4,
-                 action_size: int = 2,
-                 hidden_sizes: List[int] = [256, 128, 64],
-                 learning_rate: float = 0.001,
-                 gamma: float = 0.99,
-                 epsilon_start: float = 1.0,
-                 epsilon_end: float = 0.01,
-                 epsilon_decay: float = 0.995,
-                 batch_size: int = 64,
-                 buffer_capacity: int = 50000):
-        
-        self.base_state_size = base_state_size
-        self.num_frames = num_frames
-        self.state_size = base_state_size * num_frames
-        self.action_size = action_size
-        self.hidden_sizes = hidden_sizes
-        self.learning_rate = learning_rate
-        self.gamma = gamma
-        self.epsilon = epsilon_start
-        self.epsilon_end = epsilon_end
-        self.epsilon_decay = epsilon_decay
-        self.batch_size = batch_size
-        
-        self.target_update_freq = 500
-        self.last_target_update = 0
-        
-        # Buffer de frames pour chaque état
-        self.frame_buffer = deque(maxlen=num_frames)
-        
-        self.replay_buffer = ReplayBuffer(buffer_capacity)
-        
-        self.weights = self._init_weights()
-        self.target_weights = copy.deepcopy(self.weights)
-        
-        self.training_steps = 0
-    
-    def _init_weights(self) -> List[Tuple[np.ndarray, np.ndarray]]:
-        """Initialise les poids avec architecture plus large"""
-        weights = []
-        input_size = self.state_size
-        
-        for hidden_size in self.hidden_sizes:
-            w = np.random.randn(input_size, hidden_size) * np.sqrt(2.0 / input_size)
-            b = np.zeros(hidden_size)
-            weights.append((w, b))
-            input_size = hidden_size
-        
-        w = np.random.randn(input_size, self.action_size) * np.sqrt(2.0 / input_size)
-        b = np.zeros(self.action_size)
-        weights.append((w, b))
-        
-        return weights
-    
-    def _relu(self, x: np.ndarray) -> np.ndarray:
-        return np.maximum(0, x)
-    
-    def _forward(self, state: np.ndarray, use_target: bool = False) -> np.ndarray:
-        x = state
-        weights_to_use = self.target_weights if use_target else self.weights
-        
-        for i, (w, b) in enumerate(weights_to_use[:-1]):
-            x = self._relu(np.dot(x, w) + b)
-        
-        w, b = weights_to_use[-1]
-        return np.dot(x, w) + b
-    
-    def reset_frame_buffer(self):
-        """Réinitialise le buffer de frames"""
-        self.frame_buffer.clear()
-    
-    def _get_stacked_state(self, state: np.ndarray) -> np.ndarray:
-        """Empile les frames pour créer l'état complet"""
-        self.frame_buffer.append(state)
-        
-        # Padding avec des zéros si pas assez de frames
-        while len(self.frame_buffer) < self.num_frames:
-            self.frame_buffer.appendleft(np.zeros(self.base_state_size))
-        
-        return np.concatenate(list(self.frame_buffer))
-    
-    def predict(self, state: np.ndarray) -> np.ndarray:
-        stacked = self._get_stacked_state(state)
-        if stacked.ndim == 1:
-            stacked = stacked.reshape(1, -1)
-        return self._forward(stacked, use_target=False)
-    
-    def select_action(self, state: np.ndarray, training: bool = True) -> int:
-        if training and random.random() < self.epsilon:
-            # Toujours mettre à jour le frame buffer même en exploration
-            self._get_stacked_state(state)
-            return random.randint(0, self.action_size - 1)
-        
-        q_values = self.predict(state)
-        return int(np.argmax(q_values))
-    
-    def update(self, state: np.ndarray, action: int, reward: float,
-               next_state: np.ndarray, done: bool):
-        # Stocker les états empilés
-        stacked_state = self._get_stacked_state(state) if len(self.frame_buffer) > 0 else np.concatenate([state] * self.num_frames)
-        stacked_next = np.concatenate(list(self.frame_buffer)[1:] + [next_state])
-        
-        self.replay_buffer.push(stacked_state, action, reward, stacked_next, done)
-        
-        if done:
-            self.reset_frame_buffer()
-        
-        if len(self.replay_buffer) >= self.batch_size:
-            self._train_step()
-    
-    def _train_step(self):
-        batch = self.replay_buffer.sample(self.batch_size)
-        
-        states = np.array([t[0] for t in batch])
-        actions = np.array([t[1] for t in batch])
-        rewards = np.array([t[2] for t in batch])
-        next_states = np.array([t[3] for t in batch])
-        dones = np.array([t[4] for t in batch])
-        
-        # Double DQN
-        next_q_main = self._forward(next_states, use_target=False)
-        next_actions = np.argmax(next_q_main, axis=1)
-        
-        next_q_target = self._forward(next_states, use_target=True)
-        max_next_q = next_q_target[np.arange(len(batch)), next_actions]
-        
-        targets = rewards + self.gamma * max_next_q * (1 - dones)
-        
-        self._backprop(states, actions, targets)
-        
-        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-        self.training_steps += 1
-        
-        if self.training_steps - self.last_target_update >= self.target_update_freq:
-            self.target_weights = copy.deepcopy(self.weights)
-            self.last_target_update = self.training_steps
-    
-    def _backprop(self, states: np.ndarray, actions: np.ndarray, targets: np.ndarray):
-        """Backprop similaire au DQN standard"""
-        batch_size = len(states)
-        
-        # Forward pass pour récupérer les activations
-        x = states
-        activations = [x]
-        
-        for i, (w, b) in enumerate(self.weights[:-1]):
-            z = np.dot(x, w) + b
-            x = self._relu(z)
-            activations.append(x)
-        
-        w, b = self.weights[-1]
-        output = np.dot(x, w) + b
-        activations.append(output)
-        
-        # Gradient
-        q_values = output[np.arange(batch_size), actions]
-        td_error = targets - q_values
-        
-        grad_output = np.zeros_like(output)
-        grad_output[np.arange(batch_size), actions] = -td_error
-        
-        grad = grad_output
-        new_weights = []
-        
-        for i in reversed(range(len(self.weights))):
-            w, b = self.weights[i]
-            activation = activations[i]
-            
-            grad_w = np.dot(activation.T, grad) / batch_size
-            grad_b = np.mean(grad, axis=0)
-            
-            if i > 0:
-                grad = np.dot(grad, w.T)
-                grad = grad * (activations[i] > 0).astype(float)
-            
-            new_w = w - self.learning_rate * np.clip(grad_w, -1, 1)
-            new_b = b - self.learning_rate * np.clip(grad_b, -1, 1)
-            new_weights.insert(0, (new_w, new_b))
-        
-        self.weights = new_weights
-    
-    def save(self, filepath: str):
-        data = {
-            'weights': self.weights,
-            'target_weights': self.target_weights,
-            'epsilon': self.epsilon,
-            'training_steps': self.training_steps,
-            'config': {
-                'base_state_size': self.base_state_size,
-                'num_frames': self.num_frames,
-                'state_size': self.state_size,
-                'action_size': self.action_size,
-                'hidden_sizes': self.hidden_sizes,
-                'learning_rate': self.learning_rate,
-                'gamma': self.gamma
-            }
-        }
-        with open(filepath, 'wb') as f:
-            pickle.dump(data, f)
-        print(f"Stacked Frames DQN Agent saved to {filepath}")
-    
-    def load(self, filepath: str):
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
-        self.weights = data['weights']
-        self.target_weights = data.get('target_weights', copy.deepcopy(self.weights))
-        self.epsilon = data['epsilon']
-        self.training_steps = data['training_steps']
-        self.reset_frame_buffer()
-        print(f"Stacked Frames DQN Agent loaded from {filepath}")
