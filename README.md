@@ -1,11 +1,12 @@
 # Dash Reinforcement Learning Agent
 
 L'objectif de ce projet est de créer un jeu similaire à « Geometry Dash » et d'y entraîner un agent d'apprentissage par renforcement. Nous utiliserons différentes méthodes d'agentage afin d'obtenir le meilleur agent possible pour ce type de jeu.
-
+**Le notebook `report.ipynb`** permet d'explorer facilement l'ensemble du travail réalisé : implémentation des agents, entraînement, résultats et analyses comparatives.
 ## Structure du projet
 
 ```
 Dash_reinforcment_learning_agent/
+│   report.ipynb
 ├── Dash_Game/              # Le jeu Geometry Dash
 │   ├── main.py             # Point d'entrée du jeu manuel
 │   ├── src/
